@@ -5,6 +5,7 @@ import shutil
 import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
+from decorators.inline_buttons import music_buttons
 
 import yt_dlp as ytdlp
 from pytgcalls import PyTgCalls
