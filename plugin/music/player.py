@@ -1,12 +1,3 @@
-"""
-Yukki-style music player manager (core)
-- Uses assistant client from core.client
-- Uses pytgcalls to join/leave group calls and stream audio
-- Downloads audio via yt-dlp into temp files and streams via AudioPiped
-- Maintains per-chat queues with metadata
-- Exposes async API: enqueue, skip, stop, pause, resume, get_queue
-"""
-
 import os
 import asyncio
 import tempfile
