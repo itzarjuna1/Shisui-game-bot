@@ -1,139 +1,174 @@
 import os
+import time
 import asyncio
 import tempfile
-import shutil
-import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
-from decorators.inline_buttons import music_buttons
 
 import yt_dlp as ytdlp
 from pytgcalls import PyTgCalls
 from pytgcalls.types.input_stream import AudioPiped
 from pytgcalls.exceptions import NoActiveGroupCall
-from core.client import assistant, mongodb  # assistant Client is defined in core.client
+
+from core.client import assistant, mongodb  # assistant Client defined in core.client
 from core.config import Config
+
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# -------------------------
+# Configuration / constants
+# -------------------------
+DOWNLOADS_DIR = os.path.join("downloads", "music")
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "outtmpl": os.path.join(DOWNLOADS_DIR, "%(id)s.%(ext)s"),
+    "noplaylist": False,
+    "quiet": True,
+    "no_warnings": True,
+    # cookiefile support if provided
+    **({"cookiefile": Config.YT_COOKIES} if getattr(Config, "YT_COOKIES", "") else {}),
+}
+
+OWNER_NAME = getattr(Config, "BOT_NAME", "Mitsuha Game Bot")
+SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/YourSupportGroup")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/YourChannel")
 
 # initialize pytgcalls with assistant client
 pytgcalls = PyTgCalls(assistant)
 
-# download dir
-DOWNLOADS_DIR = os.path.join("downloads", "music")
-os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-
-# yt-dlp options (stream-safe)
-YTDL_OPTS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "outtmpl": os.path.join(DOWNLOADS_DIR, "%(id)s.%(ext)s"),
-    # use a cookies file if provided (for region-locked YouTube)
-    **({"cookiefile": Config.YT_COOKIES} if getattr(Config, "YT_COOKIES", "") else {}),
-}
-
+# -------------------------
+# Track dataclass
+# -------------------------
 @dataclass
 class Track:
-    source: str              # original query or link
+    source: str                    # original query or link
     title: str
-    duration: int            # seconds
-    file_path: str           # local file path to audio
+    duration: int                  # seconds
+    file_path: str                 # local file path
     requested_by: int
-    started_at: Optional[float] = None
     yt_info: Dict[str, Any] = field(default_factory=dict)
+    added_at: float = field(default_factory=time.time)
+    message_id: Optional[int] = None   # now playing message id (if any)
+    chat_id: Optional[int] = None
 
-
-# per-chat queues
+# -------------------------
+# Player state
+# -------------------------
 QUEUES: Dict[int, List[Track]] = {}
-# playing state locks so only single play loop per chat runs
-PLAY_LOCKS: Dict[int, asyncio.Lock] = {}
-# simple in-memory map of currently playing track for status/progress
 CURRENT: Dict[int, Optional[Track]] = {}
+PLAY_LOCKS: Dict[int, asyncio.Lock] = {}
+NOWPLAY_MESSAGES: Dict[int, int] = {}  # chat_id -> message_id of now playing
 
 # -------------------------
-# Utility / download
+# yt-dlp helpers
 # -------------------------
-async def yt_download(query: str) -> Track:
-    """
-    Download given query (yt search or direct link) using yt-dlp and return a Track.
-    This function is synchronous for yt-dlp, so run in executor.
-    """
-    loop = asyncio.get_event_loop()
-    info = await loop.run_in_executor(None, _ydl_extract, query)
-    # pick best audio file path from info
-    # ytdlp outtmpl uses id and ext so extract filename
-    file_path = None
-    if isinstance(info, dict):
-        # preferred filename: ytdl puts path in 'requested_downloads' or we can compute from id/ext
-        ext = info.get("ext") or "m4a"
-        video_id = info.get("id") or str(time.time()).replace(".", "")
-        candidate = os.path.join(DOWNLOADS_DIR, f"{video_id}.{ext}")
-        if os.path.exists(candidate):
-            file_path = candidate
-    # fallback: if info provides url (direct stream), we still need a local file to stream via AudioPiped
-    if not file_path:
-        # try to download explicitly to a temp file
-        temp_fd, temp_path = tempfile.mkstemp(suffix=".mp3", dir=DOWNLOADS_DIR)
-        os.close(temp_fd)
-        # re-run ytdlp to download to temp_path
-        ydl_opts = dict(YTDL_OPTS)
-        ydl_opts.update({"outtmpl": temp_path, "noplaylist": True})
-        await loop.run_in_executor(None, _ydl_download_to, query, ydl_opts)
-        file_path = temp_path
+def _ydl_extract(query: str, download: bool = True) -> Dict[str, Any]:
+    opts = dict(YTDL_OPTS)
+    # if we expect a search, use ytsearch: prefix
+    if not (query.startswith("http://") or query.startswith("https://")) and not query.startswith("ytsearch:"):
+        # attempt search on youtube
+        query = f"ytsearch:{query}"
+    if not download:
+        opts["noplaylist"] = True
+        with ytdlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(query, download=False)
+    else:
+        with ytdlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(query, download=True)
 
+def download_track_sync(query: str) -> Track:
+    info = _ydl_extract(query, download=True)
+    # If the query was a search result, info could be a 'entries' list
+    if isinstance(info, dict) and info.get("entries"):
+        # take first entry
+        info = info["entries"][0]
+    video_id = info.get("id") or str(int(time.time()))
+    ext = info.get("ext") or "m4a"
+    expected_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.{ext}")
+    # If yt-dlp used outtmpl as above, file should exist
+    if not os.path.exists(expected_path):
+        # attempt to find a downloaded file by searching downloads dir
+        for f in os.listdir(DOWNLOADS_DIR):
+            if f.startswith(video_id):
+                expected_path = os.path.join(DOWNLOADS_DIR, f)
+                break
     title = info.get("title", "Unknown")
-    duration = int(info.get("duration", 0) or 0)
-    requested_by = 0  # caller should set this after download
-    return Track(source=query, title=title, duration=duration, file_path=file_path, requested_by=requested_by, yt_info=info)
-
-
-def _ydl_extract(query: str):
-    with ytdlp.YoutubeDL(YTDL_OPTS) as ydl:
-        return ydl.extract_info(query, download=True)  # download=True to ensure file exists
-
-
-def _ydl_download_to(query: str, ydl_opts: Dict):
-    with ytdlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(query, download=True)
-
+    duration = int(info.get("duration") or 0)
+    return Track(source=query, title=title, duration=duration, file_path=expected_path, requested_by=0, yt_info=info)
 
 # -------------------------
-# Queue management API
+# Progress bar helper
+# -------------------------
+def progress_bar(elapsed: int, total: int, length: int = 20) -> str:
+    if total <= 0:
+        return "▮" * length
+    filled = int(length * elapsed / total)
+    bar = "█" * filled + "—" * (length - filled)
+    return f"[{bar}] {elapsed // 60}:{elapsed % 60:02d}/{total // 60}:{total % 60:02d}"
+
+# -------------------------
+# Inline buttons builder
+# -------------------------
+def build_nowplaying_keyboard(track: Track):
+    vid_tag = os.path.basename(track.file_path) if track.file_path else str(int(time.time()))
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⏯️ Pause/Resume", callback_data=f"music_toggle[{vid_tag}]"),
+                InlineKeyboardButton("⏭ Skip", callback_data=f"music_skip[{vid_tag}]"),
+            ],
+            [
+                InlineKeyboardButton("⏹ Stop", callback_data=f"music_stop[{vid_tag}]"),
+                InlineKeyboardButton("🔁 Queue", callback_data=f"music_queue[{vid_tag}]"),
+            ],
+            [
+                InlineKeyboardButton("💬 Support", url=SUPPORT_URL),
+                InlineKeyboardButton("📢 Channel", url=CHANNEL_URL),
+            ],
+            [
+                InlineKeyboardButton(f"Made by {OWNER_NAME}", url=CHANNEL_URL)
+            ]
+        ]
+    )
+
+# -------------------------
+# Public API
 # -------------------------
 async def enqueue(chat_id: int, query: str, requested_by: int) -> Track:
     """
-    Download and enqueue a track for the chat.
-    Returns the Track object.
+    Download+enqueue a track for given chat.
+    Returns Track object.
     """
-    # ensure queue exists
-    if chat_id not in QUEUES:
-        QUEUES[chat_id] = []
-    if chat_id not in PLAY_LOCKS:
-        PLAY_LOCKS[chat_id] = asyncio.Lock()
+    # Ensure queue and lock exist
+    QUEUES.setdefault(chat_id, [])
+    PLAY_LOCKS.setdefault(chat_id, asyncio.Lock())
 
-    # download (may take time) -- run without holding the play lock
-    track = await yt_download(query)
+    # Download track in executor to avoid blocking event loop
+    loop = asyncio.get_event_loop()
+    track: Track = await loop.run_in_executor(None, download_track_sync, query)
     track.requested_by = requested_by
+    track.chat_id = chat_id
 
     QUEUES[chat_id].append(track)
-    # if not currently playing, start the play loop
+    # Start play loop if not running
     if not CURRENT.get(chat_id):
-        # create task to handle playback (do not await here)
         asyncio.create_task(_play_loop(chat_id))
     return track
 
-
 async def get_queue(chat_id: int) -> List[Track]:
-    return QUEUES.get(chat_id, [])
+    return QUEUES.get(chat_id, []).copy()
 
+async def now_playing(chat_id: int) -> Optional[Track]:
+    return CURRENT.get(chat_id)
 
 async def skip(chat_id: int) -> bool:
     """
-    Skip current track. Returns True if skipped, False if nothing to skip.
+    Skip currently playing track by leaving the group call.
+    Returns True if skip initiated.
     """
-    # stopping group call playback by leaving/rejoining is handled in play loop
     if CURRENT.get(chat_id):
-        # Mark current track as finished by cancelling playback via pytgcalls
         try:
             await pytgcalls.leave_group_call(chat_id)
         except Exception:
@@ -141,18 +176,18 @@ async def skip(chat_id: int) -> bool:
         return True
     return False
 
-
-async def stop(chat_id: int) -> None:
+async def stop(chat_id: int) -> bool:
     """
-    Stop playback and clear queue for chat.
+    Stop playback and clear queue.
     """
-    QUEUES[chat_id] = []
+    if QUEUES.get(chat_id):
+        QUEUES[chat_id].clear()
     CURRENT[chat_id] = None
     try:
         await pytgcalls.leave_group_call(chat_id)
     except Exception:
         pass
-
+    return True
 
 async def pause(chat_id: int) -> bool:
     try:
@@ -161,7 +196,6 @@ async def pause(chat_id: int) -> bool:
     except Exception:
         return False
 
-
 async def resume(chat_id: int) -> bool:
     try:
         await pytgcalls.resume_stream(chat_id)
@@ -169,45 +203,68 @@ async def resume(chat_id: int) -> bool:
     except Exception:
         return False
 
-
 # -------------------------
 # Internal play loop
 # -------------------------
 async def _play_loop(chat_id: int):
     """
-    Main per-chat playback loop. Downloads already done in enqueue.
-    Streams files via AudioPiped and manages CURRENT/QUEUES state.
+    Stream tracks from QUEUES[chat_id] sequentially.
     """
-    # ensure assistant/pytgcalls is started
-    if not assistant.is_connected:
-        await assistant.start()
-    if not pytgcalls.is_connected:
-        await pytgcalls.start()
-
     lock = PLAY_LOCKS.setdefault(chat_id, asyncio.Lock())
     async with lock:
+        # Ensure assistant/pytgcalls started
+        if not assistant.is_connected:
+            try:
+                await assistant.start()
+            except Exception:
+                pass
+        try:
+            if not pytgcalls.is_connected:
+                await pytgcalls.start()
+        except Exception:
+            pass
+
         while QUEUES.get(chat_id):
             track = QUEUES[chat_id][0]
             CURRENT[chat_id] = track
-            track.started_at = time.time()
+            # Send Now Playing message (attempt via assistant or bot user)
+            try:
+                # Try to obtain a Pyrogram client to send the message: use assistant to send status message
+                sent_msg = await assistant.send_message(
+                    chat_id,
+                    f"> 🎵 Now Playing: **{track.title}**\n> ⏱ {track.duration // 60}:{track.duration % 60:02d}\n"
+                    f"> {progress_bar(0, track.duration)}\n> Made by {OWNER_NAME}"
+                )
+                track.message_id = sent_msg.message_id
+                NOWPLAY_MESSAGES[chat_id] = sent_msg.message_id
+                # edit message later to update progress (background task)
+                asyncio.create_task(_progress_updater(chat_id, track))
+            except Exception:
+                # if assistant cannot send, try bot client via Mongo-stored bot token? skip for now
+                track.message_id = None
 
-            # attempt to join & stream
+            # Join group call and stream file
             try:
                 # ensure file exists
-                if not os.path.exists(track.file_path):
-                    # if file missing, try re-download
-                    t2 = await yt_download(track.source)
-                    track.file_path = t2.file_path
+                if not track.file_path or not os.path.exists(track.file_path):
+                    # attempt re-download
+                    loop = asyncio.get_event_loop()
+                    new_track = await loop.run_in_executor(None, download_track_sync, track.source)
+                    track.file_path = new_track.file_path
+                    track.yt_info = new_track.yt_info
 
-                # join and stream
                 await pytgcalls.join_group_call(chat_id, AudioPiped(track.file_path))
             except NoActiveGroupCall:
-                # There's no active group call in the chat - we should notify and abort playback
-                # leave CURRENT and stop playback loop
+                # no active vc — abort and notify
+                try:
+                    await assistant.send_message(chat_id, "> 🛑 No active voice chat found. Start a voice chat and re-run /play.")
+                except Exception:
+                    pass
+                # stop playback loop
                 CURRENT[chat_id] = None
                 break
-            except Exception:
-                # on error, remove track and continue
+            except Exception as e:
+                # on unexpected error remove the track and continue
                 try:
                     QUEUES[chat_id].pop(0)
                 except Exception:
@@ -215,50 +272,88 @@ async def _play_loop(chat_id: int):
                 CURRENT[chat_id] = None
                 continue
 
-            # sleep for duration but wake early if track file removed / skip called
-            start = time.time()
+            # Wait while the track plays (poll)
+            start_time = time.time()
             while True:
-                elapsed = time.time() - start
+                elapsed = int(time.time() - start_time)
                 if track.duration and elapsed >= track.duration:
                     break
-                # if skip requested by external leave_group_call, the call may end — check call status
-                # simplest approach: poll every second
+                # break condition: if track was skipped/stopped (pytgcalls left)
                 await asyncio.sleep(1)
-                # if the group call is not active anymore, break
-                # PyTgCalls does not expose easy per-chat active check; attempt to continue nonetheless
-
-            # finished playback for this track
+                # If pytgcalls no longer streaming in chat, break
+                # (This is a best-effort approach)
+            # After play done, leave group call
             try:
-                # leave call to ensure clean state before next track
                 await pytgcalls.leave_group_call(chat_id)
             except Exception:
                 pass
 
-            # remove finished track
+            # Remove finished track from queue
             try:
                 QUEUES[chat_id].pop(0)
             except Exception:
                 pass
-
             CURRENT[chat_id] = None
 
-        # cleanup: when queue empty
+        # queue empty cleanup
         CURRENT[chat_id] = None
-
+        # optional: cleanup now-playing message (edit to show finished)
+        if NOWPLAY_MESSAGES.get(chat_id):
+            try:
+                await assistant.edit_message_text(
+                    chat_id,
+                    NOWPLAY_MESSAGES[chat_id],
+                    f"> ✅ Finished playing queue. Made by {OWNER_NAME}"
+                )
+            except Exception:
+                pass
+            NOWPLAY_MESSAGES.pop(chat_id, None)
 
 # -------------------------
-# Cleanup helper
+# Progress updater (edits the now playing message every 5s)
 # -------------------------
-def cleanup_downloads(older_than_seconds: int = 3600):
-    """
-    Delete downloaded files older than given seconds to avoid disk bloat.
-    """
+async def _progress_updater(chat_id: int, track: Track):
+    try:
+        msg_id = NOWPLAY_MESSAGES.get(chat_id)
+        if not msg_id:
+            return
+        start = time.time()
+        while CURRENT.get(chat_id) and CURRENT[chat_id] == track:
+            elapsed = int(time.time() - start)
+            # build progress text
+            bar = progress_bar(elapsed, track.duration)
+            txt = f"> 🎵 Now Playing: **{track.title}**\n> ⏱ {track.duration // 60}:{track.duration % 60:02d}\n> {bar}\n> Made by {OWNER_NAME}"
+            try:
+                await assistant.edit_message_text(chat_id, msg_id, txt)
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+    except Exception:
+        pass
+
+# -------------------------
+# Cleanup old downloads
+# -------------------------
+def cleanup_downloads(older_than_seconds: int = 3600 * 6):
     now = time.time()
     for fname in os.listdir(DOWNLOADS_DIR):
-        path = os.path.join(DOWNLOADS_DIR, fname)
         try:
-            mtime = os.path.getmtime(path)
-            if now - mtime > older_than_seconds:
+            path = os.path.join(DOWNLOADS_DIR, fname)
+            if os.path.isfile(path) and (now - os.path.getmtime(path)) > older_than_seconds:
                 os.remove(path)
         except Exception:
             pass
+
+# -------------------------
+# Graceful shutdown helper
+# -------------------------
+async def shutdown():
+    try:
+        await pytgcalls.stop()
+    except Exception:
+        pass
+    try:
+        await assistant.stop()
+    except Exception:
+        pass
+```0
