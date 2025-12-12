@@ -23,7 +23,7 @@ async def tsukuyomi_cmd(client: Client, message):
     
     caption = blockquote(
         "> 🌙 The red moon rises…\n"
-        "> All minds drift into Mitsuha’s Infinite love drift."
+        "> All minds drift into Mitsuha’s Infinite tsukuyomi."
     )
 
     # Send banner image (from config)
