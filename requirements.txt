@@ -1,0 +1,6 @@
+pyrogram==2.0.36
+tgcrypto
+motor
+python-dotenv
+openai
+apscheduler
